@@ -1,0 +1,122 @@
+# anomaly_detection.py
+from pyspark.mllib.clustering import KMeans, KMeansModel
+from pyspark import SQLContext,SparkConf, SparkContext
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql.functions import udf
+from pyspark.sql.types import StructType, StructField, StringType, FloatType
+import operator
+from pyspark.sql.types import StringType, ArrayType
+
+
+conf = SparkConf().setAppName('tf-idf')
+sc = SparkContext(conf=conf)
+sqlCt = SQLContext(sc)
+
+class AnomalyDetection():
+
+    def readData(self, filename):
+        self.rawDF = sqlCt.read.parquet(filename).cache()
+        return self.rawDF
+
+    def cat2Num(self, df, indices):
+        df.registerTempTable("raw")
+        sample=1
+        col1=sqlCt.sql("SELECT rawFeatures[0] FROM raw").collect()
+        disc_col1=sqlCt.sql("SELECT distinct rawFeatures[0] FROM raw").collect()
+
+        col2=sqlCt.sql("SELECT rawFeatures[1] FROM raw").collect()
+        disc_col2=sqlCt.sql("SELECT distinct rawFeatures[1] FROM raw").collect()
+
+        vector_col1=[0]*(len(disc_col1))
+        vector_col2=[0]*(len(disc_col2))
+        dictionary_col1={}
+        dictionary_col2={}
+
+        for i, j in enumerate(disc_col1):
+            vector_col1=[0]*(len(disc_col1))
+            vector_col1[i]=1
+            dictionary_col1[str(j[0])]=vector_col1
+        bc_1=sc.broadcast(dictionary_col1)
+        for i, j in enumerate(disc_col2):
+            vector_col2=[0]*(len(disc_col2))
+            vector_col2[i]=1
+            dictionary_col2[str(j[0])]=vector_col2
+        bc_2=sc.broadcast(dictionary_col2)
+
+        def transform(raw):
+            features=[]
+            features.extend(bc_1.value[raw[0]])
+            features.extend(bc_2.value[raw[1]])
+            features.extend([raw[2]])
+
+            new_list=[float(x) for x in features]
+            # map1=list(map(float,features))
+            return new_list
+
+        slen=udf(transform, ArrayType(FloatType()))
+        df1=df.withColumn("features", slen(df.rawFeatures))
+        return df1
+
+
+
+
+    def addScore(self, df):
+        df.registerTempTable("no_score")
+        col_prediction=sqlCt.sql("SELECT prediction FROM no_score").collect()
+        score_dictonary={}
+
+        for score in col_prediction:
+            if score[0] in score_dictonary.keys():
+                score_dictonary[score[0]]=score_dictonary[score[0]]+ 1
+            else:
+                score_dictonary[score[0]]=1
+        score_dict=sc.broadcast(score_dictonary)
+        print score_dictonary
+
+        def calculate_score(data):
+            N_max=float(sorted(score_dict.value.values(),reverse=True)[0])
+            N_min=float(sorted(score_dict.value.values())[0])
+            N_x=float(score_dictonary[data[0]])
+
+            try:
+                score_x = float(N_max - N_x)/(N_max - N_min)
+            except Exception:
+                score_x=0.0
+            return score_x
+        slen=udf(calculate_score, FloatType())
+        score_df=df.withColumn("score", slen(df.prediction))
+
+
+
+        return score_df
+
+
+
+    def detect(self, k, t):
+        #Encoding categorical features using one-hot.
+        df1 = self.cat2Num(self.rawDF, [0, 1]).cache()
+        df1.show()
+
+        #Clustering points using KMeans
+        features = df1.select("features").rdd.map(lambda row: row[0]).cache()
+        model = KMeans.train(features, k, maxIterations=40, runs=10, initializationMode="random", seed=20)
+
+        #Adding the prediction column to df1
+        modelBC = sc.broadcast(model)
+        predictUDF = udf(lambda x: modelBC.value.predict(x), StringType())
+        df2 = df1.withColumn("prediction", predictUDF(df1.features)).cache()
+        df2.show()
+
+        #Adding the score column to df2; The higher the score, the more likely it is an anomaly
+        df3 = self.addScore(df2).cache()
+        df3.show()
+        return df3.where(df3.score > t)
+
+
+if __name__ == "__main__":
+    ad = AnomalyDetection()
+    data_frame=ad.readData('logs-features-sample')
+    anomalies = ad.detect(8, 0.97)
+    print anomalies.count()
+    anomalies.show()
